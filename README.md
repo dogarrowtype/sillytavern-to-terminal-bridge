@@ -67,6 +67,100 @@ in the Extensions panel shows `connected` / `connecting` / `disconnected`.
 Type a line, press Enter — that becomes a user turn in SillyTavern, the AI
 generates a reply, and the reply prints in the terminal.
 
+## Telnet mode — play from a vintage machine
+
+The bridge can also listen for incoming telnet connections, so you can play
+from a Mac Plus, a Macintosh SE, an Amiga, or any other vintage box that has
+a TCP/IP stack and a telnet client.
+
+```
+python3 bridge/bridge.py --telnet 2323 --vintage mac
+```
+
+Then on the vintage machine, run telnet to your modern host's IP on port
+2323. The bridge handles the telnet protocol (IAC echo + suppress-go-ahead +
+NAWS for window size), runs a built-in line editor, and serves you the same
+chat that the SillyTavern extension is feeding it.
+
+### Presets
+
+`--vintage` picks sensible defaults for a target machine. You can override
+any of them with `--charset`, `--italic`, or `--max-width`.
+
+| Preset | charset | italic | max width | Notes |
+|---|---|---|---|---|
+| `mac` | macroman | reverse | 80 | System 6/7 / NCSA Telnet 2.7 / BetterTelnet |
+| `vt100` | ascii | reverse | 80 | Real VT100/VT220 hardware |
+| `tty` | ascii | off | 72 | Teletypes, line printers, no ANSI |
+
+- **charset**: how outgoing bytes are encoded. `macroman` is what Apple's
+  classic OS expects, so em-dashes, smart quotes, ellipses, and "fancy"
+  glyphs the AI emits arrive on a Mac as the right MacRoman characters
+  instead of UTF-8 mojibake. `ascii` transliterates them (`— → --`,
+  `“…” → "..."`).
+- **italic**: real VT100s and most period-correct emulators don't have
+  italic. `reverse` swaps in reverse-video for `*emphasis*` so it shows up.
+  `off` strips it entirely.
+
+### Picking a telnet client on classic Mac OS
+
+Two solid choices, both 68k-compatible (so they'll run on a Mac SE):
+
+- **BetterTelnet 2.0fc1** (recommended) — Rolf Braun's improved fork of
+  NCSA Telnet. Better VT100/VT220/xterm emulation, ANSI color support,
+  scrollback buffer, proper backspace/delete handling. This is the one
+  to use if your SE has the RAM (~1 MB free). Look for it on
+  Macintosh Garden.
+- **NCSA Telnet 2.7** — the original. Lighter on RAM, simpler UI, totally
+  fine for our purposes. Pick this if BetterTelnet feels heavy on the SE.
+  Also widely archived (Macintosh Garden, info-mac).
+
+Either way, before connecting:
+
+1. **Terminal Emulation: VT100** — both clients support it; usually the default.
+2. **Backspace sends:** DEL (`0x7F`) is what the bridge expects, but it
+   also accepts BS (`0x08`) so either is fine.
+3. **Local echo: OFF** — the bridge does server-side echo (the IAC
+   negotiation handles this, but if your client overrides, force it off).
+4. **Window size**: 80 × 24 fits the SE's screen nicely. The bridge picks
+   this up automatically via NAWS.
+
+### Macintosh SE on System 7.5.3 walkthrough
+
+1. On your modern host:
+   ```
+   python3 bridge/bridge.py --telnet 2323 --vintage mac
+   ```
+   The bridge logs `Telnet listening on 0.0.0.0:2323` and `WebSocket
+   listening on ws://127.0.0.1:5005`. Make sure your firewall allows
+   port 2323.
+2. On the SE, open BetterTelnet 2.0fc1 (or NCSA Telnet 2.7).
+   File → New Connection → enter your modern host's LAN IP, port `2323`,
+   emulation `VT100`. Connect.
+3. You should see a `[connected — macroman, 80c]` notice and a `> ` prompt.
+4. Open SillyTavern on any modern browser on the same LAN, with the
+   extension installed and pointed at `127.0.0.1:5005`. Pick your
+   adventure character.
+5. Type a line on the SE, press Return. It becomes a `> [your text]`
+   user turn in SillyTavern, the model generates, and the reply prints
+   on the SE — wrapped to the SE's window width (auto-detected via NAWS),
+   with `*emphasis*` shown as reverse video.
+
+The bridge's built-in line editor handles Backspace, Ctrl+U (kill line),
+Ctrl+W (kill word), and Ctrl+C (disconnect). Use the SE's normal Delete
+key — both BS (0x08) and DEL (0x7f) are treated as backspace.
+
+### Security
+
+Telnet is unencrypted. The default `--telnet 2323` binds to `0.0.0.0`
+(any interface), so anyone on your LAN who can reach the port can play
+the chat — and read whatever the AI says. Bind to a specific interface
+or use a firewall if that matters to you:
+
+```
+python3 bridge/bridge.py --telnet 192.168.1.10:2323 --vintage mac
+```
+
 ## Reading back history
 
 The bridge runs in line-mode and doesn't intercept keys, so use the terminal

@@ -2,8 +2,8 @@
 """SillyTavern Terminal Bridge — companion process.
 
 Listens on a local WebSocket port for the SillyTavern extension. Prints AI
-replies received from the extension to stdout, and forwards lines typed on
-stdin back to the extension as user turns.
+replies to the active terminal session (stdio by default, or a telnet client
+when --telnet is given) and forwards user input back as user turns.
 """
 
 import argparse
@@ -13,9 +13,11 @@ import re
 import shutil
 import sys
 import threading
-import time
+from typing import Optional
 
 import websockets
+
+# ── Styling ────────────────────────────────────────────────────────────────
 
 PROMPT = "\x1b[36;2m> \x1b[0m"
 DIM = "\x1b[2m"
@@ -23,9 +25,10 @@ RESET = "\x1b[0m"
 CLEAR_LINE = "\r\x1b[2K"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
 DEFAULT_MARGIN = 2
 DEFAULT_MAX_WIDTH = 78
-DEFAULT_TYPE_CPS = 0
+DEFAULT_TYPE_CPS = 0.0
 DEFAULT_PARA_PAUSE = 0.0
 
 
@@ -34,17 +37,90 @@ class Settings:
     max_width = DEFAULT_MAX_WIDTH
     cps = DEFAULT_TYPE_CPS
     para_pause = DEFAULT_PARA_PAUSE
+    italic_mode = "ansi"     # ansi | reverse | underline | off
+    charset = "utf8"          # utf8 | ascii | macroman
 
+
+# ── ASCII transliteration table for --charset ascii ────────────────────────
+
+_ASCII_MAP = {
+    "‐": "-", "‑": "-", "‒": "-", "–": "-",
+    "—": "--", "―": "--",
+    "‘": "'", "’": "'", "‚": ",", "‛": "'",
+    "“": '"', "”": '"', "„": '"', "‟": '"',
+    "…": "...", "•": "*", "‣": ">", "·": ".",
+    " ": " ", " ": " ", " ": " ", " ": " ",
+    " ": " ", " ": " ", " ": " ",
+    "«": "<<", "»": ">>",
+    "½": "1/2", "¼": "1/4", "¾": "3/4",
+    "°": "deg", "×": "x", "÷": "/",
+    "±": "+/-", "→": "->", "←": "<-",
+    "↑": "^", "↓": "v",
+}
+
+
+def _to_ascii(text: str) -> str:
+    out = []
+    for ch in text:
+        if ord(ch) < 128:
+            out.append(ch)
+        elif ch in _ASCII_MAP:
+            out.append(_ASCII_MAP[ch])
+        else:
+            out.append("?")
+    return "".join(out)
+
+
+def encode_for_wire(text: str) -> bytes:
+    """Encode an outgoing string per the active charset setting."""
+    if Settings.charset == "ascii":
+        return _to_ascii(text).encode("ascii", errors="replace")
+    if Settings.charset == "macroman":
+        # Most extra Latin glyphs (em-dash, smart quotes, ellipsis, …) round-trip
+        # cleanly to MacRoman. Anything else becomes '?'.
+        return text.encode("mac_roman", errors="replace")
+    return text.encode("utf-8", errors="replace")
+
+
+def decode_from_wire(data: bytes) -> str:
+    if Settings.charset == "macroman":
+        return data.decode("mac_roman", errors="replace")
+    if Settings.charset == "ascii":
+        return data.decode("ascii", errors="replace")
+    return data.decode("utf-8", errors="replace")
+
+
+# ── Italic remap (VT100 has no italic; map to reverse / underline / nothing) ──
+
+_ITALIC_ON_RE = re.compile(r"\x1b\[3m")
+_ITALIC_OFF_RE = re.compile(r"\x1b\[23m")
+
+
+def remap_italic(text: str) -> str:
+    mode = Settings.italic_mode
+    if mode == "ansi":
+        return text
+    if mode == "reverse":
+        text = _ITALIC_ON_RE.sub("\x1b[7m", text)
+        text = _ITALIC_OFF_RE.sub("\x1b[27m", text)
+        return text
+    if mode == "underline":
+        text = _ITALIC_ON_RE.sub("\x1b[4m", text)
+        text = _ITALIC_OFF_RE.sub("\x1b[24m", text)
+        return text
+    # off
+    text = _ITALIC_ON_RE.sub("", text)
+    text = _ITALIC_OFF_RE.sub("", text)
+    return text
+
+
+# ── Width-aware wrapping (ANSI-safe) ──────────────────────────────────────
 
 def visible_width(s: str) -> int:
     return len(ANSI_RE.sub("", s))
 
 
 def tokenize(text: str):
-    """Split a paragraph into tokens of (kind, value).
-
-    kinds: 'ansi' (zero-width), 'space' (run of whitespace), 'word' (visible).
-    """
     tokens = []
     i = 0
     n = len(text)
@@ -74,7 +150,6 @@ def tokenize(text: str):
 
 
 def hard_break(word: str, width: int):
-    """Split an over-long word into width-sized chunks (preserving any leading ANSI)."""
     chunks = []
     cur = ""
     cur_vis = 0
@@ -98,7 +173,6 @@ def hard_break(word: str, width: int):
 
 
 def wrap_paragraph(text: str, width: int):
-    """Wrap one paragraph (no embedded newlines) to a list of lines."""
     if width <= 0:
         return [text]
     tokens = tokenize(text)
@@ -106,7 +180,6 @@ def wrap_paragraph(text: str, width: int):
     line = ""
     line_vis = 0
     pending_space = ""
-
     for kind, val in tokens:
         if kind == "ansi":
             line += val
@@ -137,7 +210,6 @@ def wrap_paragraph(text: str, width: int):
             line += val
             line_vis += w
             pending_space = ""
-
     if line:
         lines.append(line)
     if not lines:
@@ -152,195 +224,576 @@ def wrap_text(text: str, width: int):
     return out_lines
 
 
-def effective_width() -> int:
-    cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-    usable = cols - 2 * Settings.margin
-    if Settings.max_width > 0:
-        usable = min(usable, Settings.max_width)
-    return max(20, usable)
+# ── Logging ────────────────────────────────────────────────────────────────
 
+_log_lock = threading.Lock()
+
+
+def log(msg: str) -> None:
+    """Write a bridge-operator log line to stderr (never to the active terminal)."""
+    with _log_lock:
+        sys.stderr.write(f"{DIM}[bridge]{RESET} {msg}\n")
+        sys.stderr.flush()
+
+
+# ── Terminal base ──────────────────────────────────────────────────────────
+
+class Terminal:
+    """One active user session. Subclasses provide the transport."""
+
+    def __init__(self, bridge: "Bridge", width: int = 80):
+        self.bridge = bridge
+        self.width = width
+        self.write_lock = asyncio.Lock()
+        self.input_buf = ""
+
+    def effective_width(self) -> int:
+        usable = self.width - 2 * Settings.margin
+        if Settings.max_width > 0:
+            usable = min(usable, Settings.max_width)
+        return max(20, usable)
+
+    async def _emit_bytes(self, data: bytes) -> None:
+        raise NotImplementedError
+
+    async def _emit(self, s: str) -> None:
+        await self._emit_bytes(encode_for_wire(s))
+
+    async def close(self) -> None:
+        pass
+
+    # ── Output ────────────────────────────────────────────────────────────
+
+    async def write_prompt(self) -> None:
+        await self._emit(PROMPT)
+
+    async def redraw_prompt_with_buffer(self) -> None:
+        await self._emit(CLEAR_LINE + PROMPT + self.input_buf)
+
+    async def _teletype(self, s: str) -> None:
+        if Settings.cps <= 0:
+            await self._emit(s)
+            return
+        delay = 1.0 / Settings.cps
+        i = 0
+        n = len(s)
+        while i < n:
+            m = ANSI_RE.match(s, i)
+            if m:
+                await self._emit(m.group(0))
+                i = m.end()
+                continue
+            await self._emit(s[i])
+            if not s[i].isspace() or s[i] == " ":
+                await asyncio.sleep(delay)
+            i += 1
+
+    async def print_message(self, raw_text: str) -> None:
+        text = remap_italic(raw_text)
+        async with self.write_lock:
+            await self._emit(CLEAR_LINE + "\n")
+            width = self.effective_width()
+            pad = " " * Settings.margin
+            lines = wrap_text(text.rstrip("\n"), width)
+            blank_run = 0
+            for line in lines:
+                if line.strip() == "":
+                    blank_run += 1
+                    if blank_run > 1:
+                        continue
+                    await self._emit("\n")
+                    if Settings.para_pause > 0 and Settings.cps > 0:
+                        await asyncio.sleep(Settings.para_pause)
+                    continue
+                blank_run = 0
+                await self._teletype(pad + line + RESET + "\n")
+            await self._emit("\n")
+            await self.redraw_prompt_with_buffer()
+
+    async def notify(self, msg: str) -> None:
+        async with self.write_lock:
+            await self._emit(CLEAR_LINE + f"{DIM}{msg}{RESET}\n")
+            await self.redraw_prompt_with_buffer()
+
+
+# ── Stdio terminal (cool-retro-term, plain shell) ──────────────────────────
+
+class StdioTerminal(Terminal):
+    def __init__(self, bridge, loop):
+        cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        super().__init__(bridge, cols)
+        self.loop = loop
+
+    def effective_width(self) -> int:
+        # Re-read each call so terminal resizes are picked up.
+        self.width = shutil.get_terminal_size(fallback=(80, 24)).columns
+        return super().effective_width()
+
+    async def _emit_bytes(self, data: bytes) -> None:
+        sys.stdout.buffer.write(data)
+        sys.stdout.flush()
+
+    def start_input_thread(self, stop_event: threading.Event) -> threading.Thread:
+        def reader():
+            while not stop_event.is_set():
+                try:
+                    line = input()
+                except (EOFError, KeyboardInterrupt):
+                    stop_event.set()
+                    return
+                if not line.strip():
+                    asyncio.run_coroutine_threadsafe(self.write_prompt(), self.loop)
+                    continue
+                asyncio.run_coroutine_threadsafe(
+                    self.bridge.send_user_line(line), self.loop
+                )
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        return t
+
+
+# ── Telnet protocol ────────────────────────────────────────────────────────
+
+IAC = 0xff
+DONT = 0xfe
+DO = 0xfd
+WONT = 0xfc
+WILL = 0xfb
+SB = 0xfa
+SE = 0xf0
+
+OPT_ECHO = 1
+OPT_SGA = 3        # Suppress Go-Ahead
+OPT_TTYPE = 24
+OPT_NAWS = 31
+
+
+class TelnetTerminal(Terminal):
+    # Parser states for the IAC tokenizer.
+    _S_DATA = 0
+    _S_IAC = 1
+    _S_NEG = 2          # after WILL/WONT/DO/DONT, expect option byte
+    _S_SB = 3           # collecting subnegotiation bytes
+    _S_SB_IAC = 4       # IAC seen inside SB (could be IAC SE or IAC IAC)
+
+    def __init__(self, bridge, reader: asyncio.StreamReader,
+                 writer: asyncio.StreamWriter, peer):
+        super().__init__(bridge, 80)
+        self.reader = reader
+        self.writer = writer
+        self.peer = peer
+        self._state = self._S_DATA
+        self._iac_verb: Optional[int] = None
+        self._sb_buf = bytearray()
+        self._last_cr = False
+        self._closed = False
+
+    async def _emit_bytes(self, data: bytes) -> None:
+        if self._closed:
+            return
+        # 1. Escape any 0xff data bytes (RFC 854).
+        out = data.replace(b"\xff", b"\xff\xff")
+        # 2. Normalize \n to CRLF for NVT.
+        out = out.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        try:
+            self.writer.write(out)
+            await self.writer.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            self._closed = True
+
+    async def _send_raw(self, data: bytes) -> None:
+        """Send telnet protocol bytes (IAC negotiations) without escaping."""
+        if self._closed:
+            return
+        try:
+            self.writer.write(data)
+            await self.writer.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            self._closed = True
+
+    async def negotiate(self) -> None:
+        # Server-side echo + char-at-a-time. Ask the client for NAWS.
+        await self._send_raw(bytes([
+            IAC, WILL, OPT_ECHO,
+            IAC, WILL, OPT_SGA,
+            IAC, DO, OPT_SGA,
+            IAC, DO, OPT_NAWS,
+        ]))
+        await self.notify(f"[connected — {Settings.charset}, {self.width}c]")
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.writer.close()
+            await self.writer.wait_closed()
+        except Exception:
+            pass
+
+    # ── Input loop ────────────────────────────────────────────────────────
+
+    async def run_input_loop(self) -> None:
+        try:
+            while not self.reader.at_eof():
+                chunk = await self.reader.read(256)
+                if not chunk:
+                    break
+                await self._feed(chunk)
+        except (ConnectionResetError, asyncio.IncompleteReadError):
+            pass
+
+    async def _feed(self, data: bytes) -> None:
+        for b in data:
+            await self._step(b)
+
+    async def _step(self, b: int) -> None:
+        s = self._state
+        if s == self._S_DATA:
+            if b == IAC:
+                self._state = self._S_IAC
+            else:
+                await self._on_data_byte(b)
+        elif s == self._S_IAC:
+            if b == IAC:
+                await self._on_data_byte(0xff)
+                self._state = self._S_DATA
+            elif b in (WILL, WONT, DO, DONT):
+                self._iac_verb = b
+                self._state = self._S_NEG
+            elif b == SB:
+                self._sb_buf = bytearray()
+                self._state = self._S_SB
+            else:
+                # NOP / GA / DM / BREAK / etc — ignore.
+                self._state = self._S_DATA
+        elif s == self._S_NEG:
+            await self._on_negotiate(self._iac_verb, b)
+            self._state = self._S_DATA
+        elif s == self._S_SB:
+            if b == IAC:
+                self._state = self._S_SB_IAC
+            else:
+                self._sb_buf.append(b)
+        elif s == self._S_SB_IAC:
+            if b == SE:
+                await self._on_subneg(bytes(self._sb_buf))
+                self._sb_buf = bytearray()
+                self._state = self._S_DATA
+            elif b == IAC:
+                self._sb_buf.append(0xff)
+                self._state = self._S_SB
+            else:
+                self._state = self._S_DATA
+
+    async def _on_negotiate(self, verb: int, opt: int) -> None:
+        # We don't need much. Just reply politely so the client doesn't hang.
+        if verb == WILL:
+            if opt in (OPT_NAWS, OPT_TTYPE):
+                # We did say DO NAWS; nothing more to do.
+                pass
+            else:
+                await self._send_raw(bytes([IAC, DONT, opt]))
+        elif verb == DO:
+            if opt in (OPT_ECHO, OPT_SGA):
+                pass  # already said WILL
+            else:
+                await self._send_raw(bytes([IAC, WONT, opt]))
+        # WONT/DONT: ignore (silent accept)
+
+    async def _on_subneg(self, buf: bytes) -> None:
+        if len(buf) >= 5 and buf[0] == OPT_NAWS:
+            cols = (buf[1] << 8) | buf[2]
+            if 20 <= cols <= 500:
+                self.width = cols
+                log(f"NAWS: client width = {cols}")
+
+    # ── Line editor (runs on each data byte) ──────────────────────────────
+
+    async def _on_data_byte(self, b: int) -> None:
+        # CR-LF / CR-NUL handling: CR submits, swallow the following LF or NUL.
+        if self._last_cr:
+            self._last_cr = False
+            if b in (0x00, 0x0a):
+                return
+        if b == 0x0d:  # CR
+            self._last_cr = True
+            await self._submit_line()
+            return
+        if b == 0x0a:  # bare LF
+            await self._submit_line()
+            return
+        if b == 0x03:  # Ctrl+C — close
+            await self._emit("^C\r\n")
+            await self.close()
+            return
+        if b == 0x04:  # Ctrl+D — close on empty buffer
+            if not self.input_buf:
+                await self._emit("\r\n")
+                await self.close()
+            return
+        if b in (0x08, 0x7f):  # BS or DEL — both treated as backspace
+            if self.input_buf:
+                self.input_buf = self.input_buf[:-1]
+                await self._emit("\b \b")
+            return
+        if b == 0x15:  # Ctrl+U — kill whole line
+            n = len(self.input_buf)
+            self.input_buf = ""
+            if n:
+                await self._emit("\b \b" * n)
+            return
+        if b == 0x17:  # Ctrl+W — kill word
+            i = len(self.input_buf) - 1
+            while i >= 0 and self.input_buf[i] == " ":
+                i -= 1
+            while i >= 0 and self.input_buf[i] != " ":
+                i -= 1
+            kill = len(self.input_buf) - (i + 1)
+            self.input_buf = self.input_buf[: i + 1]
+            if kill:
+                await self._emit("\b \b" * kill)
+            return
+        if b < 0x20:
+            # Other control chars: ignore.
+            return
+        # Printable byte — decode per active charset, append, echo.
+        ch = decode_from_wire(bytes([b]))
+        self.input_buf += ch
+        await self._emit(ch)
+
+    async def _submit_line(self) -> None:
+        line = self.input_buf
+        self.input_buf = ""
+        await self._emit("\r\n")
+        if not line.strip():
+            await self.write_prompt()
+            return
+        await self.bridge.send_user_line(line)
+
+
+# ── Bridge: WS to SillyTavern + active Terminal ────────────────────────────
 
 class Bridge:
     def __init__(self):
-        self.client = None
-        self.loop = None
+        self.ws_client = None
+        self.terminal: Optional[Terminal] = None
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.lock = asyncio.Lock()
 
-    async def set_client(self, ws):
+    async def set_ws_client(self, ws):
         async with self.lock:
-            old = self.client
-            self.client = ws
+            old = self.ws_client
+            self.ws_client = ws
         if old is not None and old is not ws:
             try:
                 await old.close()
             except Exception:
                 pass
 
-    async def clear_client(self, ws):
+    async def clear_ws_client(self, ws):
         async with self.lock:
-            if self.client is ws:
-                self.client = None
+            if self.ws_client is ws:
+                self.ws_client = None
 
-    async def handle_connection(self, ws):
-        await self.set_client(ws)
-        write_prompt()
+    async def set_terminal(self, term: Terminal):
+        async with self.lock:
+            old = self.terminal
+            self.terminal = term
+        if old and old is not term:
+            try:
+                await old.notify("[replaced by another session]")
+            except Exception:
+                pass
+            try:
+                await old.close()
+            except Exception:
+                pass
+
+    async def clear_terminal(self, term: Terminal):
+        async with self.lock:
+            if self.terminal is term:
+                self.terminal = None
+
+    # ── WS handling ───────────────────────────────────────────────────────
+
+    async def handle_ws(self, ws):
+        await self.set_ws_client(ws)
+        log("SillyTavern extension connected")
         try:
+            if self.terminal:
+                await self.terminal.write_prompt()
             async for raw in ws:
                 try:
                     data = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
                 if data.get("type") == "out" and isinstance(data.get("text"), str):
-                    print_message(data["text"])
+                    if self.terminal:
+                        await self.terminal.print_message(data["text"])
+                    else:
+                        log("dropped AI message (no terminal connected)")
         except websockets.ConnectionClosed:
             pass
         finally:
-            await self.clear_client(ws)
+            await self.clear_ws_client(ws)
+            log("SillyTavern extension disconnected")
 
     async def send_user_line(self, line: str):
-        async with self.lock:
-            ws = self.client
+        ws = self.ws_client
         if ws is None:
-            sys.stdout.write(f"{DIM}[no client connected]{RESET}\n")
-            write_prompt()
+            if self.terminal:
+                await self.terminal.notify("[no SillyTavern connected]")
             return
         try:
             await ws.send(json.dumps({"type": "in", "text": line}))
         except Exception as exc:
-            sys.stdout.write(f"{DIM}[send failed: {exc}]{RESET}\n")
-            write_prompt()
+            if self.terminal:
+                await self.terminal.notify(f"[send failed: {exc}]")
 
+    # ── Telnet handling ───────────────────────────────────────────────────
 
-def write_prompt():
-    sys.stdout.write(PROMPT)
-    sys.stdout.flush()
-
-
-def teletype_write(s: str):
-    """Write a string with optional per-character pacing.
-
-    ANSI escapes are emitted instantly so styling switches don't show as
-    visible delay between letters.
-    """
-    cps = Settings.cps
-    if cps <= 0:
-        sys.stdout.write(s)
-        sys.stdout.flush()
-        return
-    delay = 1.0 / cps
-    i = 0
-    n = len(s)
-    while i < n:
-        m = ANSI_RE.match(s, i)
-        if m:
-            sys.stdout.write(m.group(0))
-            i = m.end()
-            continue
-        sys.stdout.write(s[i])
-        sys.stdout.flush()
-        if not s[i].isspace() or s[i] == " ":
-            time.sleep(delay)
-        i += 1
-
-
-def print_message(text: str):
-    sys.stdout.write(CLEAR_LINE)
-    width = effective_width()
-    pad = " " * Settings.margin
-    lines = wrap_text(text.rstrip("\n"), width)
-
-    sys.stdout.write("\n")
-    blank_run = 0
-    for line in lines:
-        if line.strip() == "":
-            blank_run += 1
-            if blank_run > 1:
-                continue
-            teletype_write("\n")
-            if Settings.para_pause > 0 and Settings.cps > 0:
-                time.sleep(Settings.para_pause)
-            continue
-        blank_run = 0
-        teletype_write(pad + line + RESET + "\n")
-    sys.stdout.write("\n")
-    write_prompt()
-
-
-def stdin_reader(bridge: Bridge, stop_event: threading.Event):
-    while not stop_event.is_set():
+    async def handle_telnet(self, reader, writer):
+        peer = writer.get_extra_info("peername")
+        log(f"telnet client connected: {peer}")
+        term = TelnetTerminal(self, reader, writer, peer)
+        await self.set_terminal(term)
         try:
-            line = input()
-        except EOFError:
-            stop_event.set()
-            return
-        except KeyboardInterrupt:
-            stop_event.set()
-            return
-        if not line.strip():
-            write_prompt()
-            continue
-        asyncio.run_coroutine_threadsafe(bridge.send_user_line(line), bridge.loop)
+            await term.negotiate()
+            await term.run_input_loop()
+        finally:
+            await self.clear_terminal(term)
+            await term.close()
+            log(f"telnet client disconnected: {peer}")
 
 
-async def main_async(host: str, port: int):
+# ── Server orchestration ───────────────────────────────────────────────────
+
+def parse_endpoint(spec: str, default_host: str) -> tuple:
+    """Parse 'PORT' or 'HOST:PORT' into (host, port)."""
+    if ":" in spec:
+        host, port_s = spec.rsplit(":", 1)
+        return (host or default_host, int(port_s))
+    return (default_host, int(spec))
+
+
+async def main_async(args):
     bridge = Bridge()
     bridge.loop = asyncio.get_running_loop()
 
     stop_event = threading.Event()
-    reader_thread = threading.Thread(
-        target=stdin_reader, args=(bridge, stop_event), daemon=True
-    )
-    reader_thread.start()
+    stdio_term = None
+    if not args.telnet:
+        stdio_term = StdioTerminal(bridge, bridge.loop)
+        await bridge.set_terminal(stdio_term)
+        stdio_term.start_input_thread(stop_event)
 
-    async with websockets.serve(bridge.handle_connection, host, port):
-        sys.stdout.write(f"{DIM}[bridge listening on ws://{host}:{port}]{RESET}\n")
-        write_prompt()
-        try:
+    ws_host = args.host
+    ws_port = args.port
+    ws_server = await websockets.serve(bridge.handle_ws, ws_host, ws_port)
+    log(f"WebSocket listening on ws://{ws_host}:{ws_port}")
+
+    telnet_server = None
+    if args.telnet:
+        thost, tport = parse_endpoint(args.telnet, "0.0.0.0")
+        telnet_server = await asyncio.start_server(
+            bridge.handle_telnet, thost, tport
+        )
+        log(f"Telnet listening on {thost}:{tport}")
+
+    if stdio_term:
+        await stdio_term.write_prompt()
+
+    try:
+        if telnet_server:
+            async with telnet_server:
+                while not stop_event.is_set():
+                    await asyncio.sleep(0.2)
+        else:
             while not stop_event.is_set():
                 await asyncio.sleep(0.2)
-        except asyncio.CancelledError:
-            pass
+    except asyncio.CancelledError:
+        pass
+    finally:
+        ws_server.close()
+        await ws_server.wait_closed()
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────
+
+VINTAGE_PRESETS = {
+    "mac": {
+        "italic_mode": "reverse",
+        "charset": "macroman",
+        "max_width": 80,
+    },
+    "vt100": {
+        "italic_mode": "reverse",
+        "charset": "ascii",
+        "max_width": 80,
+    },
+    "tty": {
+        "italic_mode": "off",
+        "charset": "ascii",
+        "max_width": 72,
+    },
+}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SillyTavern Terminal Bridge")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=5005)
-    parser.add_argument(
-        "--margin",
-        type=int,
-        default=DEFAULT_MARGIN,
-        help="left/right padding columns (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--max-width",
-        type=int,
-        default=DEFAULT_MAX_WIDTH,
-        help="cap line width regardless of terminal size; 0 = no cap (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--cps",
-        type=float,
-        default=DEFAULT_TYPE_CPS,
-        help="teletype effect: characters per second; 0 = instant (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--para-pause",
-        type=float,
-        default=DEFAULT_PARA_PAUSE,
-        help="extra pause in seconds between paragraphs when --cps is on (default: %(default)s)",
-    )
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="SillyTavern Terminal Bridge")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="WebSocket bind host (default: %(default)s)")
+    p.add_argument("--port", type=int, default=5005,
+                   help="WebSocket bind port (default: %(default)s)")
+    p.add_argument("--telnet", default=None,
+                   help="Enable telnet server: PORT or HOST:PORT. "
+                        "If set, stdio is disabled and the bridge logs to stderr only.")
+    p.add_argument("--margin", type=int, default=DEFAULT_MARGIN,
+                   help="left/right padding columns (default: %(default)s)")
+    p.add_argument("--max-width", type=int, default=DEFAULT_MAX_WIDTH,
+                   help="cap line width; 0 = no cap (default: %(default)s)")
+    p.add_argument("--cps", type=float, default=DEFAULT_TYPE_CPS,
+                   help="teletype chars/sec; 0 = instant (default: %(default)s)")
+    p.add_argument("--para-pause", type=float, default=DEFAULT_PARA_PAUSE,
+                   help="extra pause between paragraphs when --cps > 0")
+    p.add_argument("--italic",
+                   choices=("ansi", "reverse", "underline", "off"),
+                   default=None,
+                   help="how to render italic; default ansi, or 'reverse' under --vintage mac/vt100")
+    p.add_argument("--charset",
+                   choices=("utf8", "ascii", "macroman"),
+                   default=None,
+                   help="wire encoding; default utf8, or set by --vintage")
+    p.add_argument("--vintage",
+                   choices=tuple(VINTAGE_PRESETS.keys()),
+                   default=None,
+                   help="preset for vintage clients: 'mac' (System 7 / NCSA Telnet), "
+                        "'vt100', 'tty'")
+    args = p.parse_args()
+
+    # Apply vintage preset first; explicit flags override.
+    if args.vintage:
+        preset = VINTAGE_PRESETS[args.vintage]
+        Settings.italic_mode = preset.get("italic_mode", Settings.italic_mode)
+        Settings.charset = preset.get("charset", Settings.charset)
+        Settings.max_width = preset.get("max_width", Settings.max_width)
+
+    if args.italic is not None:
+        Settings.italic_mode = args.italic
+    if args.charset is not None:
+        Settings.charset = args.charset
 
     Settings.margin = max(0, args.margin)
-    Settings.max_width = args.max_width
+    if args.max_width != DEFAULT_MAX_WIDTH or not args.vintage:
+        Settings.max_width = args.max_width
     Settings.cps = max(0.0, args.cps)
     Settings.para_pause = max(0.0, args.para_pause)
 
     try:
-        asyncio.run(main_async(args.host, args.port))
+        asyncio.run(main_async(args))
     except KeyboardInterrupt:
-        sys.stdout.write("\n")
+        sys.stderr.write("\n")
 
 
 if __name__ == "__main__":
