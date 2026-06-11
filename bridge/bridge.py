@@ -288,26 +288,68 @@ class Terminal:
                 await asyncio.sleep(delay)
             i += 1
 
-    async def print_message(self, raw_text: str) -> None:
+    async def _emit_block(self, raw_text: str, instant: bool = False) -> None:
+        """Render one wrapped, padded message body (no leading/trailing blank,
+        no prompt redraw). With instant=True, skip teletype and para pauses."""
         text = remap_italic(raw_text)
+        width = self.effective_width()
+        pad = " " * Settings.margin
+        lines = wrap_text(text.rstrip("\n"), width)
+        blank_run = 0
+        for line in lines:
+            if line.strip() == "":
+                blank_run += 1
+                if blank_run > 1:
+                    continue
+                await self._emit("\n")
+                if not instant and Settings.para_pause > 0 and Settings.cps > 0:
+                    await asyncio.sleep(Settings.para_pause)
+                continue
+            blank_run = 0
+            if instant:
+                await self._emit(pad + line + RESET + "\n")
+            else:
+                await self._teletype(pad + line + RESET + "\n")
+
+    async def print_block(self, raw_text: str, instant: bool = False) -> None:
+        """Print one framed message (blank line, body, blank line, prompt).
+        instant=True renders immediately for menus/system output."""
         async with self.write_lock:
             await self._emit(CLEAR_LINE + "\n")
-            width = self.effective_width()
-            pad = " " * Settings.margin
-            lines = wrap_text(text.rstrip("\n"), width)
-            blank_run = 0
-            for line in lines:
-                if line.strip() == "":
-                    blank_run += 1
-                    if blank_run > 1:
-                        continue
-                    await self._emit("\n")
-                    if Settings.para_pause > 0 and Settings.cps > 0:
-                        await asyncio.sleep(Settings.para_pause)
-                    continue
-                blank_run = 0
-                await self._teletype(pad + line + RESET + "\n")
+            await self._emit_block(raw_text, instant=instant)
             await self._emit("\n")
+            await self.redraw_prompt_with_buffer()
+
+    async def print_message(self, raw_text: str) -> None:
+        await self.print_block(raw_text, instant=False)
+
+    async def print_history(self, messages: list) -> None:
+        """Replay prior chat turns (instantly) before the live prompt.
+
+        Each entry is {"is_user": bool, "name": str, "text": str}. User turns
+        are shown with the prompt marker to mirror the live echo; AI turns are
+        rendered through the same wrapping/charset pipeline as live replies.
+        """
+        rendered = [m for m in messages if (m.get("text") or "").strip()]
+        if not rendered:
+            return
+        async with self.write_lock:
+            await self._emit(CLEAR_LINE)
+            await self._emit(f"{DIM}--- history ---{RESET}\n")
+            width = self.effective_width()
+            for m in rendered:
+                text = m.get("text") or ""
+                await self._emit("\n")
+                if m.get("is_user"):
+                    body = text[2:] if text.startswith("> ") else text
+                    lines = wrap_text(remap_italic(body), width)
+                    for idx, line in enumerate(lines):
+                        prefix = PROMPT if idx == 0 else "  "
+                        await self._emit(prefix + line + RESET + "\n")
+                else:
+                    await self._emit_block(text, instant=True)
+            await self._emit("\n")
+            await self._emit(f"{DIM}--- end of history ---{RESET}\n\n")
             await self.redraw_prompt_with_buffer()
 
     async def notify(self, msg: str) -> None:
@@ -419,7 +461,10 @@ class TelnetTerminal(Terminal):
             IAC, DO, OPT_SGA,
             IAC, DO, OPT_NAWS,
         ]))
-        await self.notify(f"[connected — {Settings.charset}, {self.width}c]")
+        await self.notify(
+            f"[connected — {Settings.charset}, {self.width}c — "
+            f"/help for commands]"
+        )
 
     async def close(self) -> None:
         if self._closed:
@@ -580,6 +625,11 @@ class Bridge:
         self.terminal: Optional[Terminal] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.lock = asyncio.Lock()
+        # Pending request/reply waiters, keyed by reply kind ("history",
+        # "chars", "selected"). Each is a list of Futures.
+        self._waiters: dict = {}
+        # Names from the last /chars listing, so "/char <n>" can resolve by index.
+        self.char_menu: list = []
 
     async def set_ws_client(self, ws):
         async with self.lock:
@@ -628,18 +678,182 @@ class Bridge:
                     data = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                if data.get("type") == "out" and isinstance(data.get("text"), str):
+                mtype = data.get("type")
+                if mtype == "out" and isinstance(data.get("text"), str):
                     if self.terminal:
                         await self.terminal.print_message(data["text"])
                     else:
                         log("dropped AI message (no terminal connected)")
+                elif mtype == "history" and isinstance(data.get("messages"), list):
+                    self._resolve("history", data["messages"])
+                elif mtype == "chars" and isinstance(data.get("characters"), list):
+                    self._resolve("chars", data)
+                elif mtype == "selected":
+                    self._resolve("selected", data)
+                elif mtype == "new_chat_result":
+                    self._resolve("new_chat_result", data)
         except websockets.ConnectionClosed:
             pass
         finally:
             await self.clear_ws_client(ws)
+            self._resolve_all(None)
             log("SillyTavern extension disconnected")
 
+    # ── Request / reply plumbing (extension round-trips) ──────────────────
+
+    def _resolve(self, kind: str, payload) -> None:
+        """Deliver a reply (or None on failure) to everyone awaiting `kind`."""
+        for fut in self._waiters.pop(kind, []):
+            if not fut.done():
+                fut.set_result(payload)
+
+    def _resolve_all(self, payload=None) -> None:
+        for kind in list(self._waiters):
+            self._resolve(kind, payload)
+
+    def _discard_waiter(self, kind: str, fut) -> None:
+        lst = self._waiters.get(kind)
+        if lst and fut in lst:
+            lst.remove(fut)
+
+    async def _request(self, kind: str, payload: dict, timeout: float = 5.0):
+        """Send `payload` to the extension and await a reply of `kind`.
+
+        Best-effort: returns None if no extension is connected, the send fails,
+        or no reply arrives in time — callers degrade gracefully instead of
+        stalling the terminal session.
+        """
+        ws = self.ws_client
+        if ws is None or self.loop is None:
+            return None
+        fut = self.loop.create_future()
+        self._waiters.setdefault(kind, []).append(fut)
+        try:
+            await ws.send(json.dumps(payload))
+        except Exception:
+            self._discard_waiter(kind, fut)
+            return None
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            self._discard_waiter(kind, fut)
+            return None
+
+    async def request_history(self, term: Terminal) -> None:
+        """Ask the extension for the chat log and replay it on `term`."""
+        messages = await self._request("history", {"type": "history_request"})
+        if messages and self.terminal is term:
+            await term.print_history(messages)
+
+    # ── Terminal-local commands ───────────────────────────────────────────
+
+    _COMMANDS = ("/help", "/chars", "/list", "/who", "/char", "/select",
+                 "/new", "/newchat", "/history")
+
+    async def maybe_handle_command(self, line: str) -> bool:
+        """Intercept bridge-local slash commands. Returns True if handled.
+
+        Anything not in `_COMMANDS` (including other "/..." text) is left for
+        SillyTavern, so roleplay slash usage still passes through untouched.
+        """
+        s = line.strip()
+        if not s.startswith("/"):
+            return False
+        parts = s.split(None, 1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if cmd not in self._COMMANDS:
+            return False
+        term = self.terminal
+        if term is None:
+            return True
+        if cmd == "/help":
+            await term.print_block(
+                "Bridge commands:\n\n"
+                "/chars            list characters (current marked *)\n"
+                "/char <n|name>    switch to a character\n"
+                "/new              start a fresh chat (keeps the old one)\n"
+                "/history          replay this chat from the top\n"
+                "/help             this message\n\n"
+                "Anything else you type is sent to the AI.",
+                instant=True,
+            )
+        elif cmd in ("/chars", "/list", "/who"):
+            await self._cmd_list_chars(term)
+        elif cmd in ("/char", "/select"):
+            await self._cmd_select_char(term, arg)
+        elif cmd in ("/new", "/newchat"):
+            await self._cmd_new_chat(term)
+        elif cmd == "/history":
+            await self.request_history(term)
+        return True
+
+    async def _cmd_list_chars(self, term: Terminal) -> None:
+        data = await self._request("chars", {"type": "chars_request"})
+        if not data:
+            await term.notify("[no character list — is SillyTavern connected?]")
+            return
+        chars = data.get("characters") or []
+        self.char_menu = [c.get("name", "") for c in chars]
+        if not chars:
+            await term.notify("[no characters found]")
+            return
+        current = data.get("current_name") or ""
+        lines = ["Characters:", ""]
+        for i, c in enumerate(chars, 1):
+            name = c.get("name", "?")
+            mark = "  *" if name == current and current else ""
+            lines.append(f"  {i:>2}. {name}{mark}")
+        lines.append("")
+        lines.append("Type  /char <number or name>  to switch.")
+        await term.print_block("\n".join(lines), instant=True)
+
+    async def _cmd_select_char(self, term: Terminal, arg: str) -> None:
+        if not arg:
+            await term.notify("[usage: /char <number or name> — see /chars]")
+            return
+        name = arg
+        if arg.isdigit() and self.char_menu:
+            idx = int(arg) - 1
+            if 0 <= idx < len(self.char_menu):
+                name = self.char_menu[idx]
+            else:
+                await term.notify(f"[no character #{arg} — try /chars]")
+                return
+        await term.notify(f"[switching to {name}…]")
+        result = await self._request(
+            "selected", {"type": "select", "name": name}, timeout=20.0
+        )
+        if not result:
+            await term.notify("[switch timed out — is SillyTavern connected?]")
+            return
+        if not result.get("ok"):
+            err = result.get("error") or "unknown error"
+            await term.notify(f"[switch failed: {err}]")
+            return
+        await term.notify(f"[now chatting with {result.get('name', name)}]")
+        if self.terminal is term:
+            await self.request_history(term)
+
+    async def _cmd_new_chat(self, term: Terminal) -> None:
+        await term.notify("[starting a new chat — the old one is kept…]")
+        result = await self._request(
+            "new_chat_result", {"type": "new_chat"}, timeout=20.0
+        )
+        if not result:
+            await term.notify("[new chat timed out — is SillyTavern connected?]")
+            return
+        if not result.get("ok"):
+            err = result.get("error") or "unknown error"
+            await term.notify(f"[new chat failed: {err}]")
+            return
+        await term.notify("[new chat started]")
+        if self.terminal is term:
+            await self.request_history(term)
+
     async def send_user_line(self, line: str):
+        if await self.maybe_handle_command(line):
+            return
         ws = self.ws_client
         if ws is None:
             if self.terminal:
@@ -660,6 +874,7 @@ class Bridge:
         await self.set_terminal(term)
         try:
             await term.negotiate()
+            await self.request_history(term)
             await term.run_input_loop()
         finally:
             await self.clear_terminal(term)

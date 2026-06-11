@@ -22,7 +22,9 @@ through SillyTavern's normal "send + trigger" path.
 
 Whatever you type in the terminal becomes a `> [your text]` user turn in
 SillyTavern, generation runs, and the reply is printed back to the terminal
-with markdown converted to ANSI (`*italic*`, `**bold**`, code fences).
+with markdown converted to ANSI (`*italic*`, `**bold**`, code fences). A handful
+of `/` commands (see [Terminal commands](#terminal-commands)) let you list and
+switch character cards without leaving the terminal.
 
 ## Install
 
@@ -160,6 +162,39 @@ or use a firewall if that matters to you:
 ```
 python3 bridge/bridge.py --telnet 192.168.1.10:2323 --vintage mac
 ```
+
+## Terminal commands
+
+A few commands typed at the prompt are handled by the bridge itself instead of
+being sent to the AI. Anything else — including other slash text like
+`/me waves` — is passed through to SillyTavern as a normal user turn.
+
+| Command | Does |
+|---|---|
+| `/chars` (`/list`, `/who`) | List character cards; the current one is marked `*` |
+| `/char <n\|name>` (`/select`) | Switch to a character by menu number or name (uses `/go`) |
+| `/new` (`/newchat`) | Start a fresh chat with the current character; the old chat is kept |
+| `/history` | Replay the current chat from the top |
+| `/help` | Show this command list |
+
+Switching with `/char` runs SillyTavern's `/go` (exact name, then prefix, then
+substring match), then replays the new character's backlog so you land in the
+conversation with its context already on screen. `/new` runs
+`/newchat delete=false`, so the chat you were in is preserved on disk and you
+can return to it from SillyTavern. Like the rest of the bridge, these are
+best-effort: with no SillyTavern connected they report that instead of hanging.
+
+## Chat backlog on connect
+
+When a telnet client connects, the bridge asks the extension for the current
+chat log and replays it — wrapped, padded, and charset-converted just like live
+replies — before showing the prompt. Prior turns appear between dim
+`--- history ---` / `--- end of history ---` markers, so you join an ongoing
+conversation with its context already on screen instead of a blank session.
+
+This is best-effort: if SillyTavern isn't connected, the chat is empty, or no
+reply arrives within a few seconds, the session just opens empty. The replay is
+instant (it ignores `--cps`/`--para-pause`); only new replies teletype.
 
 ## Reading back history
 

@@ -102,6 +102,100 @@ async function sendUserTurn(text) {
     toastr.error('Terminal Bridge: cannot send message — no compatible SillyTavern API found.');
 }
 
+function sendHistory() {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    const ctx = SillyTavern.getContext();
+    const chat = Array.isArray(ctx.chat) ? ctx.chat : [];
+    const messages = [];
+    for (const msg of chat) {
+        if (!msg) continue;
+        if (msg.is_system) continue;
+        const text = formatForTerminal(msg.mes ?? '');
+        if (!text) continue;
+        messages.push({ is_user: !!msg.is_user, name: msg.name ?? '', text });
+    }
+    try {
+        state.ws.send(JSON.stringify({ type: 'history', messages }));
+    } catch (err) {
+        console.error(LOG_PREFIX, 'failed to send history to bridge:', err);
+    }
+}
+
+function sendCharacters() {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    const ctx = SillyTavern.getContext();
+    const chars = Array.isArray(ctx.characters) ? ctx.characters : [];
+    const characters = chars
+        .filter((c) => c && typeof c.name === 'string' && c.name)
+        .map((c) => ({ name: c.name }));
+    let currentName = '';
+    const id = ctx.characterId;
+    if (id !== undefined && id !== null && chars[id]) {
+        currentName = chars[id].name ?? '';
+    }
+    try {
+        state.ws.send(JSON.stringify({ type: 'chars', characters, current_name: currentName }));
+    } catch (err) {
+        console.error(LOG_PREFIX, 'failed to send character list:', err);
+    }
+}
+
+async function selectCharacter(name) {
+    const ctx = SillyTavern.getContext();
+    let ok = false;
+    let error = '';
+    let resolvedName = name;
+    if (typeof ctx.executeSlashCommandsWithOptions === 'function') {
+        try {
+            const escaped = escapeForStscript(name);
+            await ctx.executeSlashCommandsWithOptions(`/go ${escaped}`);
+            const after = SillyTavern.getContext();
+            const id = after.characterId;
+            if (id !== undefined && id !== null && after.characters?.[id]) {
+                resolvedName = after.characters[id].name ?? name;
+            }
+            ok = true;
+        } catch (err) {
+            error = String(err?.message ?? err);
+            console.error(LOG_PREFIX, 'character switch failed:', err);
+        }
+    } else {
+        error = 'no slash command API available';
+    }
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        try {
+            state.ws.send(JSON.stringify({ type: 'selected', ok, name: resolvedName, error }));
+        } catch (err) {
+            console.error(LOG_PREFIX, 'failed to send select result:', err);
+        }
+    }
+}
+
+async function startNewChat() {
+    const ctx = SillyTavern.getContext();
+    let ok = false;
+    let error = '';
+    if (typeof ctx.executeSlashCommandsWithOptions === 'function') {
+        try {
+            // delete=false keeps the current chat on disk; this just opens a fresh one.
+            await ctx.executeSlashCommandsWithOptions('/newchat delete=false');
+            ok = true;
+        } catch (err) {
+            error = String(err?.message ?? err);
+            console.error(LOG_PREFIX, 'new chat failed:', err);
+        }
+    } else {
+        error = 'no slash command API available';
+    }
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        try {
+            state.ws.send(JSON.stringify({ type: 'new_chat_result', ok, error }));
+        } catch (err) {
+            console.error(LOG_PREFIX, 'failed to send new chat result:', err);
+        }
+    }
+}
+
 function handleIncomingChatMessage(messageId) {
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
     const ctx = SillyTavern.getContext();
@@ -169,6 +263,14 @@ function connect() {
         }
         if (data?.type === 'in' && typeof data.text === 'string') {
             await sendUserTurn(data.text);
+        } else if (data?.type === 'history_request') {
+            sendHistory();
+        } else if (data?.type === 'chars_request') {
+            sendCharacters();
+        } else if (data?.type === 'select' && typeof data.name === 'string') {
+            await selectCharacter(data.name);
+        } else if (data?.type === 'new_chat') {
+            await startNewChat();
         }
     });
 
