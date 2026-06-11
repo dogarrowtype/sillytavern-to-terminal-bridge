@@ -108,6 +108,12 @@ def remap_italic(text: str) -> str:
         text = _ITALIC_ON_RE.sub("\x1b[4m", text)
         text = _ITALIC_OFF_RE.sub("\x1b[24m", text)
         return text
+    if mode == "asterisk":
+        # No attribute change — re-mark italics with literal *asterisks*.
+        # Best for displays where reverse/underline look bad (e.g. vintage Mac).
+        text = _ITALIC_ON_RE.sub("*", text)
+        text = _ITALIC_OFF_RE.sub("*", text)
+        return text
     # off
     text = _ITALIC_ON_RE.sub("", text)
     text = _ITALIC_OFF_RE.sub("", text)
@@ -938,7 +944,7 @@ async def main_async(args):
 
 VINTAGE_PRESETS = {
     "mac": {
-        "italic_mode": "reverse",
+        "italic_mode": "asterisk",
         "charset": "macroman",
         "max_width": 80,
     },
@@ -973,9 +979,10 @@ def main():
     p.add_argument("--para-pause", type=float, default=DEFAULT_PARA_PAUSE,
                    help="extra pause between paragraphs when --cps > 0")
     p.add_argument("--italic",
-                   choices=("ansi", "reverse", "underline", "off"),
+                   choices=("ansi", "reverse", "underline", "asterisk", "off"),
                    default=None,
-                   help="how to render italic; default ansi, or 'reverse' under --vintage mac/vt100")
+                   help="how to render italic: ansi (default), reverse, underline, "
+                        "asterisk (literal *stars*, default for --vintage mac), or off")
     p.add_argument("--charset",
                    choices=("utf8", "ascii", "macroman"),
                    default=None,

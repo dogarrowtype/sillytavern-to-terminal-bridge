@@ -91,7 +91,7 @@ any of them with `--charset`, `--italic`, or `--max-width`.
 
 | Preset | charset | italic | max width | Notes |
 |---|---|---|---|---|
-| `mac` | macroman | reverse | 80 | System 6/7 / NCSA Telnet 2.7 / BetterTelnet |
+| `mac` | macroman | asterisk | 80 | System 6/7 / NCSA Telnet 2.7 / BetterTelnet |
 | `vt100` | ascii | reverse | 80 | Real VT100/VT220 hardware |
 | `tty` | ascii | off | 72 | Teletypes, line printers, no ANSI |
 
@@ -101,8 +101,9 @@ any of them with `--charset`, `--italic`, or `--max-width`.
   instead of UTF-8 mojibake. `ascii` transliterates them (`— → --`,
   `“…” → "..."`).
 - **italic**: real VT100s and most period-correct emulators don't have
-  italic. `reverse` swaps in reverse-video for `*emphasis*` so it shows up.
-  `off` strips it entirely.
+  italic. `asterisk` keeps it as literal `*emphasis*` — the default for `mac`,
+  since reverse-video looks bad on a classic Mac screen. `reverse` swaps in
+  reverse-video, `underline` uses underline, and `off` strips it entirely.
 
 ### Picking a telnet client on classic Mac OS
 
@@ -146,7 +147,8 @@ Either way, before connecting:
 5. Type a line on the SE, press Return. It becomes a `> [your text]`
    user turn in SillyTavern, the model generates, and the reply prints
    on the SE — wrapped to the SE's window width (auto-detected via NAWS),
-   with `*emphasis*` shown as reverse video.
+   with `*emphasis*` kept as literal asterisks (the `mac` preset default; pass
+   `--italic reverse` if you'd rather have reverse-video).
 
 The bridge's built-in line editor handles Backspace, Ctrl+U (kill line),
 Ctrl+W (kill word), and Ctrl+C (disconnect). Use the SE's normal Delete

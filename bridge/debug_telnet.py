@@ -268,7 +268,8 @@ def main():
     p.add_argument("--max-width", type=int, default=DEFAULT_MAX_WIDTH)
     p.add_argument("--cps", type=float, default=DEFAULT_TYPE_CPS)
     p.add_argument("--para-pause", type=float, default=DEFAULT_PARA_PAUSE)
-    p.add_argument("--italic", choices=("ansi", "reverse", "underline", "off"),
+    p.add_argument("--italic",
+                   choices=("ansi", "reverse", "underline", "asterisk", "off"),
                    default=None)
     p.add_argument("--charset", choices=("utf8", "ascii", "macroman"),
                    default=None)
